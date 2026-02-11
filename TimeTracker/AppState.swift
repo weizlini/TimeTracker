@@ -22,6 +22,10 @@ final class AppState: ObservableObject {
     private var lastAutoStoppedProjectId: UUID?
     private var lastAutoStopAt: Date?
 
+    private var lastResumePromptAt: Date?
+    private var pendingResumeWorkItem: DispatchWorkItem?
+    private var didRetryResumePrompt = false
+
     init() {
         do {
             projects = try store.loadOrDefault([Project].self, from: projectsFile, defaultValue: [])
@@ -32,7 +36,6 @@ final class AppState: ObservableObject {
             entries = []
         }
 
-        // Resume: if there is a running entry in JSON, reflect it.
         if let running = entries.first(where: { $0.endAt == nil }) {
             runningEntryId = running.id
             selectedProjectId = running.projectId
@@ -48,7 +51,7 @@ final class AppState: ObservableObject {
             },
             onUnlock: { [weak self] in
                 Task { @MainActor in
-                    self?.promptResumeIfNeeded()
+                    self?.schedulePersistentResumePrompt()
                 }
             }
         )
@@ -78,6 +81,8 @@ final class AppState: ObservableObject {
 
     private func start() {
         guard let pid = selectedProjectId else { return }
+
+        // If anything is "running" somehow, end it as system to keep integrity
         endRunningEntry(reason: .system)
 
         let e = TimeEntry(projectId: pid, startAt: Date(), endAt: nil, endedReason: nil)
@@ -87,6 +92,11 @@ final class AppState: ObservableObject {
     }
 
     func endRunningEntry(reason: EndedReason) {
+        // If user explicitly stopped, do NOT prompt resume later.
+        if reason == .user {
+            clearResumeContext()
+        }
+
         guard let rid = runningEntryId else { return }
 
         guard let idx = entries.firstIndex(where: { $0.id == rid }) else {
@@ -103,6 +113,9 @@ final class AppState: ObservableObject {
             if reason == .system {
                 lastAutoStoppedProjectId = entries[idx].projectId
                 lastAutoStopAt = endedAt
+
+                didRetryResumePrompt = false
+                lastResumePromptAt = nil
             }
         }
 
@@ -142,7 +155,21 @@ final class AppState: ObservableObject {
         catch { print("SAVE entries failed:", error) }
     }
 
-    // MARK: - Resume Notification
+    // MARK: - Resume Notification (only for system auto-stop)
+
+    private func clearResumeContext() {
+        lastAutoStoppedProjectId = nil
+        lastAutoStopAt = nil
+        didRetryResumePrompt = false
+        lastResumePromptAt = nil
+
+        pendingResumeWorkItem?.cancel()
+        pendingResumeWorkItem = nil
+
+        // Remove any currently posted resume notifications (best effort)
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [])
+        // Note: delivered identifiers are not tracked here; we keep it simple and rely on the gating.
+    }
 
     private func setupResumeNotifications() {
         let center = UNUserNotificationCenter.current()
@@ -175,16 +202,55 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func promptResumeIfNeeded() {
+    private func schedulePersistentResumePrompt() {
+        guard runningEntryId == nil else { return }
+
+        guard let _ = lastAutoStoppedProjectId,
+              let _ = lastAutoStopAt else { return }
+
+        pendingResumeWorkItem?.cancel()
+        pendingResumeWorkItem = nil
+
+        if let last = lastResumePromptAt, Date().timeIntervalSince(last) < 10 {
+            return
+        }
+
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                self?.promptResumeNowOrRetry()
+            }
+        }
+        pendingResumeWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: work)
+    }
+
+    private func promptResumeNowOrRetry() {
         guard runningEntryId == nil else { return }
 
         guard let pid = lastAutoStoppedProjectId,
               let stoppedAt = lastAutoStopAt else { return }
 
-        let secondsSince = Date().timeIntervalSince(stoppedAt)
-        if secondsSince < 2 { return }
-        if secondsSince > 2 * 3600 { return }
+        let secondsSinceStop = Date().timeIntervalSince(stoppedAt)
+        if secondsSinceStop < 2 { return }
+        if secondsSinceStop > 4 * 3600 { return }
 
+        lastResumePromptAt = Date()
+        postResumeNotification(projectId: pid)
+
+        if !didRetryResumePrompt {
+            didRetryResumePrompt = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 20.0) { [weak self] in
+                Task { @MainActor in
+                    guard let self else { return }
+                    guard self.runningEntryId == nil else { return }
+                    guard self.lastAutoStoppedProjectId == pid else { return }
+                    self.postResumeNotification(projectId: pid)
+                }
+            }
+        }
+    }
+
+    private func postResumeNotification(projectId pid: UUID) {
         let projectName = projects.first(where: { $0.id == pid })?.name ?? "your project"
 
         let content = UNMutableNotificationContent()
@@ -195,7 +261,7 @@ final class AppState: ObservableObject {
         content.userInfo = ["projectId": pid.uuidString]
 
         let req = UNNotificationRequest(
-            identifier: "resume-\(UUID().uuidString)",
+            identifier: "resume-prompt-\(pid.uuidString)",
             content: content,
             trigger: nil
         )
@@ -217,8 +283,6 @@ final class AppState: ObservableObject {
 
     // MARK: - CSV Export (daily totals)
 
-    /// Exports a daily summary CSV (one row per day) to Desktop/TimeTracker.
-    /// Columns: date,hours
     func exportAllEntriesCSV() -> URL? {
         let dir: URL
         do {
@@ -258,9 +322,7 @@ final class AppState: ObservableObject {
                 guard let nextDayStart = cal.date(byAdding: .day, value: 1, to: dayStart) else { break }
 
                 let sliceEnd = min(end, nextDayStart)
-                let sliceSecondsDouble = sliceEnd.timeIntervalSince(cursor)
-                let sliceSeconds = Int(sliceSecondsDouble.rounded(.toNearestOrAwayFromZero))
-
+                let sliceSeconds = Int(sliceEnd.timeIntervalSince(cursor).rounded(.toNearestOrAwayFromZero))
                 secondsByDayStart[dayStart, default: 0] += max(0, sliceSeconds)
                 cursor = sliceEnd
             }
