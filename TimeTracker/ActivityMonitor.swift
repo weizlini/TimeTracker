@@ -1,56 +1,106 @@
 import Foundation
 import AppKit
 
-/// Best-effort "pause triggers" for a menu bar time tracker.
-/// - screensaver start/stop notifications (DistributedNotificationCenter)
-/// - system sleep / screen sleep (NSWorkspace notifications)
-/// - session resign active (lock / fast user switching)
 final class ActivityMonitor {
-    private var tokens: [Any] = []
-    private var onPause: (() -> Void)?
+    private var onStop: (() -> Void)?
+    private var onUnlock: (() -> Void)?
 
-    func start(onPause: @escaping () -> Void) {
+    private var stopFired = false
+
+    private var ncObservers: [Any] = []
+    private var wsObservers: [Any] = []
+    private var distObservers: [Any] = []
+
+    func start(onStop: @escaping () -> Void, onUnlock: @escaping () -> Void) {
         stop()
-        self.onPause = onPause
 
-        let ws = NSWorkspace.shared
-        let nc = ws.notificationCenter
+        self.onStop = onStop
+        self.onUnlock = onUnlock
+        self.stopFired = false
 
-        tokens.append(nc.addObserver(
-            forName: NSWorkspace.willSleepNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in self?.onPause?() })
+        let nc = NotificationCenter.default
+        let wsnc = NSWorkspace.shared.notificationCenter
+        let dnc = DistributedNotificationCenter.default()
 
-        tokens.append(nc.addObserver(
-            forName: NSWorkspace.screensDidSleepNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in self?.onPause?() })
-
-        tokens.append(nc.addObserver(
+        // Session resign (sometimes on lock/login window)
+        ncObservers.append(nc.addObserver(
             forName: NSWorkspace.sessionDidResignActiveNotification,
             object: nil,
             queue: .main
-        ) { [weak self] _ in self?.onPause?() })
+        ) { [weak self] _ in
+            self?.fireStopOnce()
+        })
 
-        // Screensaver start (most direct for your request).
-        let dnc = DistributedNotificationCenter.default()
-        tokens.append(dnc.addObserver(
+        // Sleep
+        wsObservers.append(wsnc.addObserver(
+            forName: NSWorkspace.willSleepNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.fireStopOnce()
+        })
+
+        // Displays sleep
+        wsObservers.append(wsnc.addObserver(
+            forName: NSWorkspace.screensDidSleepNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.fireStopOnce()
+        })
+
+        // Screensaver start (covers some screensaver paths)
+        distObservers.append(dnc.addObserver(
             forName: Notification.Name("com.apple.screensaver.didstart"),
             object: nil,
             queue: .main
-        ) { [weak self] _ in self?.onPause?() })
+        ) { [weak self] _ in
+            self?.fireStopOnce()
+        })
+
+        // Screen lock (covers Touch ID lock / Lock Screen)
+        distObservers.append(dnc.addObserver(
+            forName: Notification.Name("com.apple.screenIsLocked"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.fireStopOnce()
+        })
+
+        // Screen unlock (prompt resume)
+        distObservers.append(dnc.addObserver(
+            forName: Notification.Name("com.apple.screenIsUnlocked"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.stopFired = false
+            self.onUnlock?()
+        })
     }
 
     func stop() {
-        let ws = NSWorkspace.shared
-        let nc = ws.notificationCenter
-        for t in tokens { nc.removeObserver(t) }
-        // DistributedNotificationCenter observers must also be removed via DNC.
-        DistributedNotificationCenter.default().removeObserver(self)
-        tokens.removeAll()
-        onPause = nil
+        let nc = NotificationCenter.default
+        let wsnc = NSWorkspace.shared.notificationCenter
+        let dnc = DistributedNotificationCenter.default()
+
+        for o in ncObservers { nc.removeObserver(o) }
+        for o in wsObservers { wsnc.removeObserver(o) }
+        for o in distObservers { dnc.removeObserver(o) }
+
+        ncObservers.removeAll()
+        wsObservers.removeAll()
+        distObservers.removeAll()
+
+        onStop = nil
+        onUnlock = nil
+        stopFired = false
+    }
+
+    private func fireStopOnce() {
+        guard !stopFired else { return }
+        stopFired = true
+        onStop?()
     }
 
     deinit { stop() }

@@ -5,14 +5,16 @@ internal import Combine
 struct ContentView: View {
     @ObservedObject var state: AppState
 
-    @State private var showingAdd = false
+    @State private var isAddingProject = false
     @State private var newProjectName = ""
+    @FocusState private var addProjectFieldFocused: Bool
 
     @State private var now = Date()
     private let ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+
             HStack(spacing: 8) {
                 Picker("Project", selection: Binding(
                     get: { state.selectedProjectId },
@@ -25,12 +27,34 @@ struct ContentView: View {
                 .frame(minWidth: 220)
 
                 Button {
-                    newProjectName = ""
-                    showingAdd = true
+                    beginAddProject()
                 } label: {
                     Image(systemName: "plus")
                 }
                 .help("Add project")
+            }
+
+            if isAddingProject {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("New Project")
+                        .font(.headline)
+
+                    TextField("Name", text: $newProjectName)
+                        .textFieldStyle(.roundedBorder)
+                        .focused($addProjectFieldFocused)
+                        .onSubmit { commitAddProject() }
+
+                    HStack {
+                        Button("Cancel") { cancelAddProject() }
+                            .keyboardShortcut(.escape, modifiers: [])
+
+                        Spacer()
+
+                        Button("Add") { commitAddProject() }
+                            .disabled(newProjectName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            .keyboardShortcut(.return, modifiers: [])
+                    }
+                }
             }
 
             HStack(spacing: 10) {
@@ -87,28 +111,29 @@ struct ContentView: View {
             }
         }
         .padding(16)
-        .frame(width: 420, height: 190)
+        .frame(width: 420, height: isAddingProject ? 250 : 190)
         .onReceive(ticker) { d in now = d }
-        .sheet(isPresented: $showingAdd) {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("New Project").font(.headline)
+    }
 
-                TextField("Name", text: $newProjectName)
-                    .textFieldStyle(.roundedBorder)
-
-                HStack {
-                    Spacer()
-                    Button("Cancel") { showingAdd = false }
-                    Button("Add") {
-                        state.addProject(name: newProjectName)
-                        showingAdd = false
-                    }
-                    .disabled(newProjectName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }
-            }
-            .padding(16)
-            .frame(width: 360)
+    private func beginAddProject() {
+        newProjectName = ""
+        isAddingProject = true
+        DispatchQueue.main.async {
+            addProjectFieldFocused = true
         }
+    }
+
+    private func cancelAddProject() {
+        isAddingProject = false
+        newProjectName = ""
+        addProjectFieldFocused = false
+    }
+
+    private func commitAddProject() {
+        let trimmed = newProjectName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        state.addProject(name: trimmed)
+        cancelAddProject()
     }
 
     private func formatHMS(_ totalSeconds: Int) -> String {

@@ -11,7 +11,7 @@ struct TimeTrackerApp: App {
         } label: {
             MenuBarLabelView(state: state)
         }
-        .menuBarExtraStyle(.window)
+        .menuBarExtraStyle(.window) 
 
         Settings {
             Text("TimeTracker")

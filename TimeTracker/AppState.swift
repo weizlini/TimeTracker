@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import UserNotifications
 internal import Combine
 
 @MainActor
@@ -15,29 +16,42 @@ final class AppState: ObservableObject {
 
     private let monitor = ActivityMonitor()
 
+    private let resumeActionId = "RESUME_ACTION"
+    private let resumeCategoryId = "RESUME_CATEGORY"
+
+    private var lastAutoStoppedProjectId: UUID?
+    private var lastAutoStopAt: Date?
+
     init() {
         do {
             projects = try store.loadOrDefault([Project].self, from: projectsFile, defaultValue: [])
             entries = try store.loadOrDefault([TimeEntry].self, from: entriesFile, defaultValue: [])
         } catch {
-            // If the Desktop path fails (sandbox ON), you'll see it quickly.
             print("LOAD failed:", error)
             projects = []
             entries = []
         }
 
         // Resume: if there is a running entry in JSON, reflect it.
-        // (We only store running via endAt==nil, so find it.)
         if let running = entries.first(where: { $0.endAt == nil }) {
             runningEntryId = running.id
             selectedProjectId = running.projectId
         }
 
-        monitor.start { [weak self] in
-            Task { @MainActor in
-                self?.endRunningEntry(reason: .system)
+        setupResumeNotifications()
+
+        monitor.start(
+            onStop: { [weak self] in
+                Task { @MainActor in
+                    self?.endRunningEntry(reason: .system)
+                }
+            },
+            onUnlock: { [weak self] in
+                Task { @MainActor in
+                    self?.promptResumeIfNeeded()
+                }
             }
-        }
+        )
     }
 
     var runningEntry: TimeEntry? {
@@ -64,7 +78,6 @@ final class AppState: ObservableObject {
 
     private func start() {
         guard let pid = selectedProjectId else { return }
-        // End any stray running entry (shouldn't happen, but keep it safe).
         endRunningEntry(reason: .system)
 
         let e = TimeEntry(projectId: pid, startAt: Date(), endAt: nil, endedReason: nil)
@@ -82,9 +95,15 @@ final class AppState: ObservableObject {
         }
 
         if entries[idx].endAt == nil {
-            entries[idx].endAt = Date()
+            let endedAt = Date()
+            entries[idx].endAt = endedAt
             entries[idx].endedReason = reason
             persistEntries()
+
+            if reason == .system {
+                lastAutoStoppedProjectId = entries[idx].projectId
+                lastAutoStopAt = endedAt
+            }
         }
 
         runningEntryId = nil
@@ -123,10 +142,83 @@ final class AppState: ObservableObject {
         catch { print("SAVE entries failed:", error) }
     }
 
-    // MARK: - CSV Export (simplified)
+    // MARK: - Resume Notification
 
-    /// Exports all completed entries (endAt != nil) as CSV to Desktop/TimeTracker.
-    /// Columns: project,start,end,hours
+    private func setupResumeNotifications() {
+        let center = UNUserNotificationCenter.current()
+
+        let resume = UNNotificationAction(
+            identifier: resumeActionId,
+            title: "Resume",
+            options: [.foreground]
+        )
+
+        let category = UNNotificationCategory(
+            identifier: resumeCategoryId,
+            actions: [resume],
+            intentIdentifiers: [],
+            options: []
+        )
+
+        center.setNotificationCategories([category])
+        center.delegate = NotificationDelegate.shared
+
+        NotificationDelegate.shared.onResume = { [weak self] projectId in
+            Task { @MainActor in
+                self?.resumeFromReminder(projectId: projectId)
+            }
+        }
+
+        center.requestAuthorization(options: [.alert, .sound]) { granted, err in
+            if let err = err { print("Notif auth error:", err) }
+            if !granted { print("Notif not granted") }
+        }
+    }
+
+    private func promptResumeIfNeeded() {
+        guard runningEntryId == nil else { return }
+
+        guard let pid = lastAutoStoppedProjectId,
+              let stoppedAt = lastAutoStopAt else { return }
+
+        let secondsSince = Date().timeIntervalSince(stoppedAt)
+        if secondsSince < 2 { return }
+        if secondsSince > 2 * 3600 { return }
+
+        let projectName = projects.first(where: { $0.id == pid })?.name ?? "your project"
+
+        let content = UNMutableNotificationContent()
+        content.title = "Resume tracking?"
+        content.body = "You were tracking \(projectName). Do you want to resume?"
+        content.sound = .default
+        content.categoryIdentifier = resumeCategoryId
+        content.userInfo = ["projectId": pid.uuidString]
+
+        let req = UNNotificationRequest(
+            identifier: "resume-\(UUID().uuidString)",
+            content: content,
+            trigger: nil
+        )
+
+        UNUserNotificationCenter.current().add(req) { err in
+            if let err = err { print("Notif add error:", err) }
+        }
+    }
+
+    private func resumeFromReminder(projectId: UUID?) {
+        guard runningEntryId == nil else { return }
+
+        let pid = projectId ?? selectedProjectId ?? lastAutoStoppedProjectId
+        guard let pid else { return }
+
+        selectedProjectId = pid
+        start()
+    }
+
+    // MARK: - CSV Export (daily totals)
+
+    /// Exports a daily summary CSV (one row per day) to Desktop/TimeTracker.
+    /// Columns: date,hours
     func exportAllEntriesCSV() -> URL? {
         let dir: URL
         do {
@@ -136,42 +228,57 @@ final class AppState: ObservableObject {
             return nil
         }
 
-        let df = DateFormatter()
-        df.dateFormat = "yyyy-MM-dd HH:mm"
+        let cal = Calendar.current
+        let now = Date()
+
+        let dayFormatter = DateFormatter()
+        dayFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dayFormatter.timeZone = TimeZone.current
+        dayFormatter.dateFormat = "yyyy-MM-dd"
 
         let timestamp = {
             let tf = DateFormatter()
+            tf.locale = Locale(identifier: "en_US_POSIX")
             tf.dateFormat = "yyyyMMdd-HHmmss"
             return tf.string(from: Date())
         }()
 
-        let outURL = dir.appendingPathComponent("time_entries-\(timestamp).csv")
+        let outURL = dir.appendingPathComponent("time_entries-by-day-\(timestamp).csv")
 
-        func projectName(for id: UUID) -> String {
-            projects.first(where: { $0.id == id })?.name ?? "Unknown Project"
+        var secondsByDayStart: [Date: Int] = [:]
+
+        for e in entries {
+            let start = e.startAt
+            let end = e.endAt ?? now
+            guard end > start else { continue }
+
+            var cursor = start
+            while cursor < end {
+                let dayStart = cal.startOfDay(for: cursor)
+                guard let nextDayStart = cal.date(byAdding: .day, value: 1, to: dayStart) else { break }
+
+                let sliceEnd = min(end, nextDayStart)
+                let sliceSecondsDouble = sliceEnd.timeIntervalSince(cursor)
+                let sliceSeconds = Int(sliceSecondsDouble.rounded(.toNearestOrAwayFromZero))
+
+                secondsByDayStart[dayStart, default: 0] += max(0, sliceSeconds)
+                cursor = sliceEnd
+            }
         }
 
-        func csvEscape(_ s: String) -> String {
-            if s.contains(",") || s.contains("\"") || s.contains("\n") || s.contains("\r") {
-                return "\"\(s.replacingOccurrences(of: "\"", with: "\"\""))\""
-            }
-            return s
-        }
+        let header = "date,hours"
 
-        let header = "project,start,end,hours"
-
-        let rows: [String] = entries
-            .sorted { $0.startAt < $1.startAt }
-            .compactMap { e in
-                guard let endAt = e.endAt else { return nil }
-                let start = df.string(from: e.startAt)
-                let end = df.string(from: endAt)
-                let seconds = max(0, Int(endAt.timeIntervalSince(e.startAt)))
-                let hours = Double(seconds) / 3600.0
-                return "\(csvEscape(projectName(for: e.projectId))),\(start),\(end),\(String(format: "%.2f", hours))"
+        let rows: [String] = secondsByDayStart
+            .keys
+            .sorted()
+            .map { dayStart in
+                let secs = secondsByDayStart[dayStart] ?? 0
+                let hours = Double(secs) / 3600.0
+                let hoursStr = String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), hours)
+                return "\(dayFormatter.string(from: dayStart)),\(hoursStr)"
             }
 
-        let csv = ([header] + rows).joined(separator: "\n")
+        let csv = ([header] + rows).joined(separator: "\n") + "\n"
 
         do {
             try csv.write(to: outURL, atomically: true, encoding: .utf8)
