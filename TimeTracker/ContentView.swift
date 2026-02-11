@@ -14,7 +14,6 @@ struct ContentView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-
             HStack(spacing: 8) {
                 Picker("Project", selection: Binding(
                     get: { state.selectedProjectId },
@@ -85,12 +84,6 @@ struct ContentView: View {
                 Spacer()
             }
 
-            if let running = state.runningEntry,
-               let p = state.projects.first(where: { $0.id == running.projectId }) {
-                Text("Running: \(p.name)")
-                    .foregroundStyle(.secondary)
-            }
-
             Spacer()
 
             Divider()
@@ -105,7 +98,7 @@ struct ContentView: View {
                 Spacer()
 
                 Button("Quit") {
-                    NSApplication.shared.terminate(nil)
+                    state.stopAndQuit()
                 }
                 .keyboardShortcut("q")
             }

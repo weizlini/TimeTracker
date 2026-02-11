@@ -36,9 +36,18 @@ final class AppState: ObservableObject {
             entries = []
         }
 
+        // If there is a running entry in JSON, reflect it.
         if let running = entries.first(where: { $0.endAt == nil }) {
             runningEntryId = running.id
             selectedProjectId = running.projectId
+        } else {
+            // Otherwise: select project from the most recent entry (by endAt if present, else startAt)
+            if let last = entries.max(by: { sortKey($0) < sortKey($1) }) {
+                selectedProjectId = last.projectId
+            } else {
+                // If no entries, select first project if available
+                selectedProjectId = projects.first?.id
+            }
         }
 
         setupResumeNotifications()
@@ -55,6 +64,11 @@ final class AppState: ObservableObject {
                 }
             }
         )
+    }
+
+    private func sortKey(_ e: TimeEntry) -> Date {
+        // Prefer endAt if available so the last finished entry wins
+        e.endAt ?? e.startAt
     }
 
     var runningEntry: TimeEntry? {
@@ -82,13 +96,29 @@ final class AppState: ObservableObject {
     private func start() {
         guard let pid = selectedProjectId else { return }
 
-        // If anything is "running" somehow, end it as system to keep integrity
+        // End any stray running entry (shouldn't happen, but safe)
         endRunningEntry(reason: .system)
 
         let e = TimeEntry(projectId: pid, startAt: Date(), endAt: nil, endedReason: nil)
         entries.append(e)
         runningEntryId = e.id
         persistEntries()
+    }
+
+    /// Stops the running entry (if any), as a USER action (no resume prompt later).
+    func stopIfRunningForQuitOrUserStop() {
+        if runningEntryId != nil {
+            endRunningEntry(reason: .user)
+        } else {
+            // even if not running, ensure any pending resume prompt is cleared
+            clearResumeContext()
+        }
+    }
+
+    /// Stops first (user) then quits.
+    func stopAndQuit() {
+        stopIfRunningForQuitOrUserStop()
+        NSApplication.shared.terminate(nil)
     }
 
     func endRunningEntry(reason: EndedReason) {
@@ -165,10 +195,6 @@ final class AppState: ObservableObject {
 
         pendingResumeWorkItem?.cancel()
         pendingResumeWorkItem = nil
-
-        // Remove any currently posted resume notifications (best effort)
-        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [])
-        // Note: delivered identifiers are not tracked here; we keep it simple and rely on the gating.
     }
 
     private func setupResumeNotifications() {
@@ -204,9 +230,7 @@ final class AppState: ObservableObject {
 
     private func schedulePersistentResumePrompt() {
         guard runningEntryId == nil else { return }
-
-        guard let _ = lastAutoStoppedProjectId,
-              let _ = lastAutoStopAt else { return }
+        guard lastAutoStoppedProjectId != nil, lastAutoStopAt != nil else { return }
 
         pendingResumeWorkItem?.cancel()
         pendingResumeWorkItem = nil
@@ -283,6 +307,8 @@ final class AppState: ObservableObject {
 
     // MARK: - CSV Export (daily totals)
 
+    /// Exports a daily summary CSV (one row per day) to Desktop/TimeTracker.
+    /// Columns: date,hours
     func exportAllEntriesCSV() -> URL? {
         let dir: URL
         do {
