@@ -1,17 +1,21 @@
-//
-//  TimeTrackerApp.swift
-//  TimeTracker
-//
-//  Created by Will Eizlini on 2026-02-11.
-//
-
 import SwiftUI
+internal import Combine
 
 @main
 struct TimeTrackerApp: App {
+    @StateObject private var state = AppState()
+
     var body: some Scene {
-        WindowGroup {
-            ContentView()
+        MenuBarExtra {
+            ContentView(state: state)
+        } label: {
+            MenuBarLabelView(state: state)
+        }
+        .menuBarExtraStyle(.window)
+
+        Settings {
+            Text("TimeTracker")
+                .padding()
         }
     }
 }
