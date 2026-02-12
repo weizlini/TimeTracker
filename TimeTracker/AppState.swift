@@ -86,6 +86,7 @@ final class AppState: ObservableObject {
             endRunningEntry(reason: .user)
         }
     }
+
     func addProject(name: String) {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -101,6 +102,7 @@ final class AppState: ObservableObject {
         do { try store.save(projects, to: projectsFile) }
         catch { print("SAVE projects failed:", error) }
     }
+
     private func start() {
         guard canStart else { return }
 
@@ -170,10 +172,19 @@ final class AppState: ObservableObject {
         catch { print("SAVE entries failed:", error) }
     }
 
-    // MARK: - CSV Export (daily totals)
+    // MARK: - CSV Export
 
-    /// Exports a daily summary CSV (one row per day) to Desktop/TimeTracker.
-    /// Columns: date,hours
+    private func csvEscape(_ value: String) -> String {
+        if value.contains(",") || value.contains("\n") || value.contains("\r") || value.contains("\"") {
+            let doubled = value.replacingOccurrences(of: "\"", with: "\"\"")
+            return "\"\(doubled)\""
+        }
+        return value
+    }
+
+    /// Exports a summary CSV grouped by project + note.
+    /// Columns: project,note,hours
+    /// - Hours are rounded to 3 decimals.
     func exportAllEntriesCSV() -> URL? {
         let dir: URL
         do {
@@ -183,52 +194,56 @@ final class AppState: ObservableObject {
             return nil
         }
 
-        let cal = Calendar.current
         let now = Date()
 
-        let dayFormatter = DateFormatter()
-        dayFormatter.locale = Locale(identifier: "en_US_POSIX")
-        dayFormatter.timeZone = TimeZone.current
-        dayFormatter.dateFormat = "yyyy-MM-dd"
-
-        let timestamp = {
+        let timestamp: String = {
             let tf = DateFormatter()
             tf.locale = Locale(identifier: "en_US_POSIX")
+            tf.timeZone = TimeZone.current
             tf.dateFormat = "yyyyMMdd-HHmmss"
-            return tf.string(from: Date())
+            return tf.string(from: now)
         }()
 
-        let outURL = dir.appendingPathComponent("time_entries-by-day-\(timestamp).csv")
+        let outURL = dir.appendingPathComponent("time_entries-by-project-note-\(timestamp).csv")
 
-        var secondsByDayStart: [Date: Int] = [:]
+        let projectNameById: [UUID: String] = Dictionary(
+            uniqueKeysWithValues: projects.map { ($0.id, $0.name) }
+        )
+
+        struct Key: Hashable {
+            let projectName: String
+            let note: String
+        }
+
+        var secondsByKey: [Key: Int] = [:]
 
         for e in entries {
             let start = e.startAt
             let end = e.endAt ?? now
             guard end > start else { continue }
 
-            var cursor = start
-            while cursor < end {
-                let dayStart = cal.startOfDay(for: cursor)
-                guard let nextDayStart = cal.date(byAdding: .day, value: 1, to: dayStart) else { break }
+            let projectName = projectNameById[e.projectId] ?? "(Unknown Project)"
+            let note = (e.note ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
 
-                let sliceEnd = min(end, nextDayStart)
-                let sliceSeconds = Int(sliceEnd.timeIntervalSince(cursor).rounded(.toNearestOrAwayFromZero))
-                secondsByDayStart[dayStart, default: 0] += max(0, sliceSeconds)
-                cursor = sliceEnd
-            }
+            let secs = Int(end.timeIntervalSince(start).rounded(.toNearestOrAwayFromZero))
+            secondsByKey[Key(projectName: projectName, note: note), default: 0] += max(0, secs)
         }
 
-        let header = "date,hours"
+        let header = "project,note,hours"
 
-        let rows: [String] = secondsByDayStart
+        let rows: [String] = secondsByKey
             .keys
-            .sorted()
-            .map { dayStart in
-                let secs = secondsByDayStart[dayStart] ?? 0
+            .sorted { a, b in
+                if a.projectName != b.projectName {
+                    return a.projectName.localizedCaseInsensitiveCompare(b.projectName) == .orderedAscending
+                }
+                return a.note.localizedCaseInsensitiveCompare(b.note) == .orderedAscending
+            }
+            .map { key in
+                let secs = secondsByKey[key] ?? 0
                 let hours = Double(secs) / 3600.0
                 let hoursStr = String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), hours)
-                return "\(dayFormatter.string(from: dayStart)),\(hoursStr)"
+                return "\(csvEscape(key.projectName)),\(csvEscape(key.note)),\(hoursStr)"
             }
 
         let csv = ([header] + rows).joined(separator: "\n") + "\n"
