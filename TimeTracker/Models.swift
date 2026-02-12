@@ -22,17 +22,22 @@ struct TimeEntry: Codable, Identifiable, Equatable {
     var endAt: Date?
     var endedReason: EndedReason?
 
+    // Optional task/line-item description. Optional so older JSON still loads.
+    var note: String?
+
     init(
         id: UUID = UUID(),
         projectId: UUID,
         startAt: Date,
         endAt: Date? = nil,
-        endedReason: EndedReason? = nil
+        endedReason: EndedReason? = nil,
+        note: String? = nil
     ) {
         self.id = id
         self.projectId = projectId
         self.startAt = startAt
         self.endAt = endAt
         self.endedReason = endedReason
+        self.note = note
     }
 }
