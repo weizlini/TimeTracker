@@ -186,6 +186,39 @@ final class AppState: ObservableObject {
         return value
     }
 
+    private func timestampString(for date: Date) -> String {
+        let tf = DateFormatter()
+        tf.locale = Locale(identifier: "en_US_POSIX")
+        tf.timeZone = TimeZone.current
+        tf.dateFormat = "yyyyMMdd-HHmmss"
+        return tf.string(from: date)
+    }
+
+    private func dayFormatter() -> DateFormatter {
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US_POSIX")
+        df.timeZone = TimeZone.current
+        df.dateFormat = "yyyy-MM-dd"
+        return df
+    }
+
+    private func filenameSafe(_ name: String) -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return "Project" }
+
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+        let mapped = trimmed.unicodeScalars.map { scalar -> Character in
+            if allowed.contains(scalar) { return Character(scalar) }
+            return "_"
+        }
+        let s = String(mapped)
+        // collapse multiple underscores a bit (simple pass)
+        while s.contains("__") {
+            return s.replacingOccurrences(of: "__", with: "_")
+        }
+        return s
+    }
+
     /// Export columns (in this order): project,date,task,hours
     /// - Splits any entry that crosses midnight into separate day slices.
     /// - Groups by (project, date, task) and sums time.
@@ -202,27 +235,14 @@ final class AppState: ObservableObject {
         let now = Date()
         let cal = Calendar.current
 
-        let timestamp: String = {
-            let tf = DateFormatter()
-            tf.locale = Locale(identifier: "en_US_POSIX")
-            tf.timeZone = TimeZone.current
-            tf.dateFormat = "yyyyMMdd-HHmmss"
-            return tf.string(from: now)
-        }()
-
+        let timestamp = timestampString(for: now)
         let outURL = dir.appendingPathComponent("time_entries-\(timestamp).csv")
 
         let projectNameById: [UUID: String] = Dictionary(
             uniqueKeysWithValues: projects.map { ($0.id, $0.name) }
         )
 
-        let dayFormatter: DateFormatter = {
-            let df = DateFormatter()
-            df.locale = Locale(identifier: "en_US_POSIX")
-            df.timeZone = TimeZone.current
-            df.dateFormat = "yyyy-MM-dd"
-            return df
-        }()
+        let df = dayFormatter()
 
         struct Key: Hashable {
             let project: String
@@ -249,7 +269,7 @@ final class AppState: ObservableObject {
                 guard sliceEnd > sliceStart else { break }
 
                 let secs = Int(sliceEnd.timeIntervalSince(sliceStart).rounded(.toNearestOrAwayFromZero))
-                let dateStr = dayFormatter.string(from: sliceStart)
+                let dateStr = df.string(from: sliceStart)
 
                 let key = Key(project: projectName, date: dateStr, task: task)
                 secondsByKey[key, default: 0] += max(0, secs)
@@ -273,6 +293,92 @@ final class AppState: ObservableObject {
                 let hours = Double(secs) / 3600.0
                 let hoursStr = String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), hours)
                 return "\(csvEscape(key.project)),\(csvEscape(key.date)),\(csvEscape(key.task)),\(hoursStr)"
+            }
+
+        let csv = ([header] + rows).joined(separator: "\n") + "\n"
+
+        do {
+            try csv.write(to: outURL, atomically: true, encoding: .utf8)
+            return outURL
+        } catch {
+            print("EXPORT failed:", error)
+            return nil
+        }
+    }
+
+    /// Export only ONE project.
+    /// Columns: date,task,hours
+    /// - Splits any entry that crosses midnight into separate day slices.
+    /// - Groups by (date, task) and sums time.
+    /// - Hours are rounded to 3 decimals.
+    /// - Filename includes the project name.
+    func exportProjectEntriesCSV(projectId: UUID) -> URL? {
+        let dir: URL
+        do {
+            dir = try store.appSupportDir()
+        } catch {
+            print("EXPORT failed: cannot resolve dir:", error)
+            return nil
+        }
+
+        let now = Date()
+        let cal = Calendar.current
+        let df = dayFormatter()
+
+        let projectNameById: [UUID: String] = Dictionary(
+            uniqueKeysWithValues: projects.map { ($0.id, $0.name) }
+        )
+
+        let projectNameRaw = projectNameById[projectId] ?? "Project"
+        let projectNameSafe = filenameSafe(projectNameRaw)
+
+        let timestamp = timestampString(for: now)
+        let outURL = dir.appendingPathComponent("time_entries-\(projectNameSafe)-\(timestamp).csv")
+
+        struct Key: Hashable {
+            let date: String
+            let task: String
+        }
+
+        var secondsByKey: [Key: Int] = [:]
+
+        for e in entries where e.projectId == projectId {
+            let start = e.startAt
+            let end = e.endAt ?? now
+            guard end > start else { continue }
+
+            let task = (e.note ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+
+            var sliceStart = start
+            while sliceStart < end {
+                let dayStart = cal.startOfDay(for: sliceStart)
+                guard let nextDayStart = cal.date(byAdding: .day, value: 1, to: dayStart) else { break }
+
+                let sliceEnd = min(end, nextDayStart)
+                guard sliceEnd > sliceStart else { break }
+
+                let secs = Int(sliceEnd.timeIntervalSince(sliceStart).rounded(.toNearestOrAwayFromZero))
+                let dateStr = df.string(from: sliceStart)
+
+                let key = Key(date: dateStr, task: task)
+                secondsByKey[key, default: 0] += max(0, secs)
+
+                sliceStart = sliceEnd
+            }
+        }
+
+        let header = "date,task,hours"
+
+        let rows: [String] = secondsByKey.keys
+            .sorted { a, b in
+                if a.date != b.date { return a.date < b.date }
+                return a.task.localizedCaseInsensitiveCompare(b.task) == .orderedAscending
+            }
+            .map { key in
+                let secs = secondsByKey[key] ?? 0
+                let hours = Double(secs) / 3600.0
+                let hoursStr = String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), hours)
+                return "\(csvEscape(key.date)),\(csvEscape(key.task)),\(hoursStr)"
             }
 
         let csv = ([header] + rows).joined(separator: "\n") + "\n"

@@ -10,6 +10,9 @@ struct ContentView: View {
     @FocusState private var addProjectFieldFocused: Bool
     @FocusState private var noteFieldFocused: Bool
 
+    @State private var exportExpanded = false
+    @State private var exportProjectId: UUID?
+
     @State private var now = Date()
     private let ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
@@ -139,11 +142,42 @@ struct ContentView: View {
 
             Divider()
 
-            HStack {
-                Button("Export CSV") {
-                    if let url = state.exportAllEntriesCSV() {
-                        NSWorkspace.shared.activateFileViewerSelecting([url])
+            HStack(alignment: .top) {
+                DisclosureGroup("Export", isExpanded: $exportExpanded) {
+                    VStack(alignment: .leading, spacing: 10) {
+
+                        if state.projects.isEmpty {
+                            Text("Add a project to export.")
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Picker("Project", selection: Binding(
+                                get: { exportProjectId ?? state.selectedProjectId ?? state.projects.first?.id },
+                                set: { exportProjectId = $0 }
+                            )) {
+                                ForEach(state.projects) { p in
+                                    Text(p.name).tag(Optional(p.id))
+                                }
+                            }
+                            .frame(minWidth: 240)
+
+                            HStack(spacing: 10) {
+                                Button("Export This Project") {
+                                    guard let pid = exportProjectId ?? state.selectedProjectId ?? state.projects.first?.id else { return }
+                                    if let url = state.exportProjectEntriesCSV(projectId: pid) {
+                                        NSWorkspace.shared.activateFileViewerSelecting([url])
+                                    }
+                                }
+                                .disabled((exportProjectId ?? state.selectedProjectId ?? state.projects.first?.id) == nil)
+
+                                Button("Export All Projects") {
+                                    if let url = state.exportAllEntriesCSV() {
+                                        NSWorkspace.shared.activateFileViewerSelecting([url])
+                                    }
+                                }
+                            }
+                        }
                     }
+                    .padding(.top, 6)
                 }
 
                 Spacer()
@@ -155,9 +189,11 @@ struct ContentView: View {
             }
         }
         .padding(16)
-        .frame(width: 420, height: isAddingProject ? 320 : 260)
+        .frame(width: 420, height: viewHeight)
         .onReceive(ticker) { d in now = d }
         .onAppear {
+            exportProjectId = state.selectedProjectId ?? state.projects.first?.id
+
             DispatchQueue.main.async {
                 if hasSelectedProject {
                     noteFieldFocused = true
@@ -165,6 +201,10 @@ struct ContentView: View {
             }
         }
         .onChange(of: state.selectedProjectId) { _, newValue in
+            if exportProjectId == nil {
+                exportProjectId = newValue
+            }
+
             DispatchQueue.main.async {
                 if newValue != nil && !state.projects.isEmpty {
                     noteFieldFocused = true
@@ -173,6 +213,17 @@ struct ContentView: View {
                 }
             }
         }
+        .onChange(of: state.projects) { _, newProjects in
+            if exportProjectId == nil {
+                exportProjectId = newProjects.first?.id
+            }
+        }
+    }
+
+    private var viewHeight: CGFloat {
+        if isAddingProject { return 320 }
+        if exportExpanded { return 320 }
+        return 260
     }
 
     private var primaryButtonTitle: String {
@@ -199,6 +250,7 @@ struct ContentView: View {
         let trimmed = newProjectName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         state.addProject(name: trimmed)
+        exportProjectId = state.selectedProjectId
         cancelAddProject()
     }
 
