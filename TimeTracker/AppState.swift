@@ -146,11 +146,15 @@ final class AppState: ObservableObject {
         NSApplication.shared.terminate(nil)
     }
 
+    // MARK: - Used by menu bar title
+
     func runningSeconds(at now: Date = Date()) -> Int {
         guard let e = runningEntry else { return 0 }
         return max(0, Int(now.timeIntervalSince(e.startAt)))
     }
 
+    /// Total seconds today for a project, including the currently-running entry (counted up to `now`).
+    /// This is used by the menu bar title.
     func totalSecondsTodayLive(for projectId: UUID, at now: Date = Date()) -> Int {
         let cal = Calendar.current
         let startOfDay = cal.startOfDay(for: now)
@@ -182,8 +186,9 @@ final class AppState: ObservableObject {
         return value
     }
 
-    /// Exports a summary CSV grouped by project + note.
-    /// Columns: project,note,hours
+    /// Export columns (in this order): project,date,task,hours
+    /// - Splits any entry that crosses midnight into separate day slices.
+    /// - Groups by (project, date, task) and sums time.
     /// - Hours are rounded to 3 decimals.
     func exportAllEntriesCSV() -> URL? {
         let dir: URL
@@ -195,6 +200,7 @@ final class AppState: ObservableObject {
         }
 
         let now = Date()
+        let cal = Calendar.current
 
         let timestamp: String = {
             let tf = DateFormatter()
@@ -204,15 +210,24 @@ final class AppState: ObservableObject {
             return tf.string(from: now)
         }()
 
-        let outURL = dir.appendingPathComponent("time_entries-by-project-note-\(timestamp).csv")
+        let outURL = dir.appendingPathComponent("time_entries-\(timestamp).csv")
 
         let projectNameById: [UUID: String] = Dictionary(
             uniqueKeysWithValues: projects.map { ($0.id, $0.name) }
         )
 
+        let dayFormatter: DateFormatter = {
+            let df = DateFormatter()
+            df.locale = Locale(identifier: "en_US_POSIX")
+            df.timeZone = TimeZone.current
+            df.dateFormat = "yyyy-MM-dd"
+            return df
+        }()
+
         struct Key: Hashable {
-            let projectName: String
-            let note: String
+            let project: String
+            let date: String
+            let task: String
         }
 
         var secondsByKey: [Key: Int] = [:]
@@ -223,27 +238,41 @@ final class AppState: ObservableObject {
             guard end > start else { continue }
 
             let projectName = projectNameById[e.projectId] ?? "(Unknown Project)"
-            let note = (e.note ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let task = (e.note ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
 
-            let secs = Int(end.timeIntervalSince(start).rounded(.toNearestOrAwayFromZero))
-            secondsByKey[Key(projectName: projectName, note: note), default: 0] += max(0, secs)
+            var sliceStart = start
+            while sliceStart < end {
+                let dayStart = cal.startOfDay(for: sliceStart)
+                guard let nextDayStart = cal.date(byAdding: .day, value: 1, to: dayStart) else { break }
+
+                let sliceEnd = min(end, nextDayStart)
+                guard sliceEnd > sliceStart else { break }
+
+                let secs = Int(sliceEnd.timeIntervalSince(sliceStart).rounded(.toNearestOrAwayFromZero))
+                let dateStr = dayFormatter.string(from: sliceStart)
+
+                let key = Key(project: projectName, date: dateStr, task: task)
+                secondsByKey[key, default: 0] += max(0, secs)
+
+                sliceStart = sliceEnd
+            }
         }
 
-        let header = "project,note,hours"
+        let header = "project,date,task,hours"
 
-        let rows: [String] = secondsByKey
-            .keys
+        let rows: [String] = secondsByKey.keys
             .sorted { a, b in
-                if a.projectName != b.projectName {
-                    return a.projectName.localizedCaseInsensitiveCompare(b.projectName) == .orderedAscending
+                if a.project != b.project {
+                    return a.project.localizedCaseInsensitiveCompare(b.project) == .orderedAscending
                 }
-                return a.note.localizedCaseInsensitiveCompare(b.note) == .orderedAscending
+                if a.date != b.date { return a.date < b.date }
+                return a.task.localizedCaseInsensitiveCompare(b.task) == .orderedAscending
             }
             .map { key in
                 let secs = secondsByKey[key] ?? 0
                 let hours = Double(secs) / 3600.0
                 let hoursStr = String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), hours)
-                return "\(csvEscape(key.projectName)),\(csvEscape(key.note)),\(hoursStr)"
+                return "\(csvEscape(key.project)),\(csvEscape(key.date)),\(csvEscape(key.task)),\(hoursStr)"
             }
 
         let csv = ([header] + rows).joined(separator: "\n") + "\n"
