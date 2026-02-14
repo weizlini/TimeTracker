@@ -120,15 +120,24 @@ struct ContentView: View {
                 .disabled(!canUsePrimaryButton)
 
                 if let pid = state.selectedProjectId {
-                    let todaySecs = state.totalSecondsTodayLive(for: pid, at: now)
-                    Text("Today: \(formatHMS(todaySecs))")
-                        .monospacedDigit()
-                        .foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 10) {
+                            let todaySecs = state.totalSecondsTodayLive(for: pid, at: now)
+                            Text("Today: \(formatHMS(todaySecs))")
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
 
-                    if state.runningEntry != nil {
-                        let runSecs = state.runningSeconds(at: now)
-                        Text("Session: \(formatHMS(runSecs))")
+                            if state.runningEntry != nil {
+                                let runSecs = state.runningSeconds(at: now)
+                                Text("Session: \(formatHMS(runSecs))")
+                                    .monospacedDigit()
+                            }
+                        }
+
+                        let allSecs = state.totalSecondsAllTimeLive(for: pid, at: now)
+                        Text("All: \(formatHours(allSecs))h")
                             .monospacedDigit()
+                            .foregroundStyle(.secondary)
                     }
                 } else {
                     Text("Pick a project")
@@ -252,6 +261,11 @@ struct ContentView: View {
         state.addProject(name: trimmed)
         exportProjectId = state.selectedProjectId
         cancelAddProject()
+    }
+
+    private func formatHours(_ totalSeconds: Int) -> String {
+        let hours = Double(totalSeconds) / 3600.0
+        return String(format: "%.3f", hours)
     }
 
     private func formatHMS(_ totalSeconds: Int) -> String {

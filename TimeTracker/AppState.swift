@@ -47,10 +47,14 @@ final class AppState: ObservableObject {
         monitor.start(
             onStop: { [weak self] in
                 Task { @MainActor in
-                    self?.endRunningEntry(reason: .system)
+                    self?.autoStopRunningEntry()
                 }
             },
-            onUnlock: { }
+            onUnlock: { [weak self] in
+                Task { @MainActor in
+                    self?.maybePromptResumeAfterUnlock()
+                }
+            }
         )
     }
 
@@ -146,6 +150,16 @@ final class AppState: ObservableObject {
         NSApplication.shared.terminate(nil)
     }
 
+    private func autoStopRunningEntry() {
+        guard let running = runningEntry else { return }
+        endRunningEntry(reason: .system)
+        scheduleResumeNotification(projectId: running.projectId)
+    }
+
+    private func maybePromptResumeAfterUnlock() {
+        resumeLastAutoStoppedIfRecent()
+    }
+
     // MARK: - Used by menu bar title
 
     func runningSeconds(at now: Date = Date()) -> Int {
@@ -166,6 +180,18 @@ final class AppState: ObservableObject {
                 if end < startOfDay { return nil }
                 let clampedStart = max(entry.startAt, startOfDay)
                 let seconds = Int(end.timeIntervalSince(clampedStart))
+                return max(0, seconds)
+            }
+            .reduce(0, +)
+    }
+
+    /// Total seconds for a project across *all time*, including the currently-running entry (counted up to `now`).
+    func totalSecondsAllTimeLive(for projectId: UUID, at now: Date = Date()) -> Int {
+        return entries
+            .filter { $0.projectId == projectId }
+            .compactMap { entry -> Int? in
+                let end = entry.endAt ?? now
+                let seconds = Int(end.timeIntervalSince(entry.startAt))
                 return max(0, seconds)
             }
             .reduce(0, +)
@@ -219,6 +245,94 @@ final class AppState: ObservableObject {
         return s
     }
 
+    func exportProjectEntriesCSV(projectId: UUID) -> URL? {
+        let dir: URL
+        do {
+            dir = try store.appSupportDir()
+        } catch {
+            print("EXPORT failed: cannot resolve dir:", error)
+            return nil
+        }
+
+        let now = Date()
+        let cal = Calendar.current
+
+        let timestamp = timestampString(for: now)
+        let projectName = projects.first(where: { $0.id == projectId })?.name ?? "Unknown"
+        let safeProjectName = filenameSafe(projectName)
+        let outURL = dir.appendingPathComponent("\(safeProjectName)-\(timestamp).csv")
+
+        let df = dayFormatter()
+
+        struct Key: Hashable {
+            let date: String
+            let task: String
+        }
+
+        var secondsByKey: [Key: Int] = [:]
+
+        for e in entries where e.projectId == projectId {
+            let start = e.startAt
+            let end = e.endAt ?? now
+            guard end > start else { continue }
+
+            let task = (e.note ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let safeTask = task.isEmpty ? "(no task)" : task
+
+            // Walk day by day if it crosses midnight.
+            var cursor = start
+            while cursor < end {
+                let dayStart = cal.startOfDay(for: cursor)
+                guard let nextDayStart = cal.date(byAdding: .day, value: 1, to: dayStart) else { break }
+
+                let sliceStart = max(cursor, dayStart)
+                let sliceEnd = min(end, nextDayStart)
+
+                if sliceEnd > sliceStart {
+                    let dateStr = df.string(from: dayStart)
+                    let key = Key(date: dateStr, task: safeTask)
+                    let seconds = Int(sliceEnd.timeIntervalSince(sliceStart))
+                    secondsByKey[key, default: 0] += max(0, seconds)
+                }
+
+                cursor = nextDayStart
+            }
+        }
+
+        // Stable ordering for readability
+        let sortedKeys = secondsByKey.keys.sorted {
+            if $0.date != $1.date { return $0.date < $1.date }
+            return $0.task < $1.task
+        }
+
+        var lines: [String] = []
+        lines.append("date,task,hours")
+
+        for key in sortedKeys {
+            let seconds = secondsByKey[key] ?? 0
+            let hours = Double(seconds) / 3600.0
+            let hoursStr = String(format: "%.3f", hours)
+
+            let row = [
+                csvEscape(key.date),
+                csvEscape(key.task),
+                csvEscape(hoursStr)
+            ].joined(separator: ",")
+
+            lines.append(row)
+        }
+
+        let csv = lines.joined(separator: "\n") + "\n"
+
+        do {
+            try csv.write(to: outURL, atomically: true, encoding: .utf8)
+            return outURL
+        } catch {
+            print("EXPORT failed: write:", error)
+            return nil
+        }
+    }
+
     /// Export columns (in this order): project,date,task,hours
     /// - Splits any entry that crosses midnight into separate day slices.
     /// - Groups by (project, date, task) and sums time.
@@ -257,138 +371,128 @@ final class AppState: ObservableObject {
             let end = e.endAt ?? now
             guard end > start else { continue }
 
-            let projectName = projectNameById[e.projectId] ?? "(Unknown Project)"
+            let projectName = projectNameById[e.projectId] ?? "Unknown"
             let task = (e.note ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let safeTask = task.isEmpty ? "(no task)" : task
 
-            var sliceStart = start
-            while sliceStart < end {
-                let dayStart = cal.startOfDay(for: sliceStart)
+            // Walk day by day if it crosses midnight.
+            var cursor = start
+            while cursor < end {
+                let dayStart = cal.startOfDay(for: cursor)
                 guard let nextDayStart = cal.date(byAdding: .day, value: 1, to: dayStart) else { break }
 
+                let sliceStart = max(cursor, dayStart)
                 let sliceEnd = min(end, nextDayStart)
-                guard sliceEnd > sliceStart else { break }
 
-                let secs = Int(sliceEnd.timeIntervalSince(sliceStart).rounded(.toNearestOrAwayFromZero))
-                let dateStr = df.string(from: sliceStart)
+                if sliceEnd > sliceStart {
+                    let dateStr = df.string(from: dayStart)
+                    let key = Key(project: projectName, date: dateStr, task: safeTask)
+                    let seconds = Int(sliceEnd.timeIntervalSince(sliceStart))
+                    secondsByKey[key, default: 0] += max(0, seconds)
+                }
 
-                let key = Key(project: projectName, date: dateStr, task: task)
-                secondsByKey[key, default: 0] += max(0, secs)
-
-                sliceStart = sliceEnd
+                cursor = nextDayStart
             }
         }
 
-        let header = "project,date,task,hours"
+        // Stable ordering for readability
+        let sortedKeys = secondsByKey.keys.sorted {
+            if $0.project != $1.project { return $0.project < $1.project }
+            if $0.date != $1.date { return $0.date < $1.date }
+            return $0.task < $1.task
+        }
 
-        let rows: [String] = secondsByKey.keys
-            .sorted { a, b in
-                if a.project != b.project {
-                    return a.project.localizedCaseInsensitiveCompare(b.project) == .orderedAscending
-                }
-                if a.date != b.date { return a.date < b.date }
-                return a.task.localizedCaseInsensitiveCompare(b.task) == .orderedAscending
-            }
-            .map { key in
-                let secs = secondsByKey[key] ?? 0
-                let hours = Double(secs) / 3600.0
-                let hoursStr = String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), hours)
-                return "\(csvEscape(key.project)),\(csvEscape(key.date)),\(csvEscape(key.task)),\(hoursStr)"
-            }
+        var lines: [String] = []
+        lines.append("project,date,task,hours")
 
-        let csv = ([header] + rows).joined(separator: "\n") + "\n"
+        for key in sortedKeys {
+            let seconds = secondsByKey[key] ?? 0
+            let hours = Double(seconds) / 3600.0
+            let hoursStr = String(format: "%.3f", hours)
+
+            let row = [
+                csvEscape(key.project),
+                csvEscape(key.date),
+                csvEscape(key.task),
+                csvEscape(hoursStr)
+            ].joined(separator: ",")
+
+            lines.append(row)
+        }
+
+        let csv = lines.joined(separator: "\n") + "\n"
 
         do {
             try csv.write(to: outURL, atomically: true, encoding: .utf8)
             return outURL
         } catch {
-            print("EXPORT failed:", error)
+            print("EXPORT failed: write:", error)
             return nil
         }
     }
 
-    /// Export only ONE project.
-    /// Columns: date,task,hours
-    /// - Splits any entry that crosses midnight into separate day slices.
-    /// - Groups by (date, task) and sums time.
-    /// - Hours are rounded to 3 decimals.
-    /// - Filename includes the project name.
-    func exportProjectEntriesCSV(projectId: UUID) -> URL? {
-        let dir: URL
-        do {
-            dir = try store.appSupportDir()
-        } catch {
-            print("EXPORT failed: cannot resolve dir:", error)
-            return nil
+    // MARK: - Notifications (resume after auto-stop)
+
+    func configureResumeNotificationsIfNeeded() {
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert, .sound]) { granted, error in
+            if let error = error {
+                print("NOTIF auth error:", error)
+                return
+            }
+            if !granted {
+                print("NOTIF not granted")
+                return
+            }
+            self.registerResumeCategory()
         }
+    }
 
-        let now = Date()
-        let cal = Calendar.current
-        let df = dayFormatter()
-
-        let projectNameById: [UUID: String] = Dictionary(
-            uniqueKeysWithValues: projects.map { ($0.id, $0.name) }
+    private func registerResumeCategory() {
+        let resume = UNNotificationAction(
+            identifier: resumeActionId,
+            title: "Resume",
+            options: [.foreground]
         )
 
-        let projectNameRaw = projectNameById[projectId] ?? "Project"
-        let projectNameSafe = filenameSafe(projectNameRaw)
+        let cat = UNNotificationCategory(
+            identifier: resumeCategoryId,
+            actions: [resume],
+            intentIdentifiers: [],
+            options: []
+        )
 
-        let timestamp = timestampString(for: now)
-        let outURL = dir.appendingPathComponent("time_entries-\(projectNameSafe)-\(timestamp).csv")
+        UNUserNotificationCenter.current().setNotificationCategories([cat])
+    }
 
-        struct Key: Hashable {
-            let date: String
-            let task: String
+    private func scheduleResumeNotification(projectId: UUID) {
+        // Remember for "resume on click"
+        lastAutoStoppedProjectId = projectId
+        lastAutoStopAt = Date()
+
+        let content = UNMutableNotificationContent()
+        content.title = "Timer stopped"
+        content.body = "Resume the last project?"
+        content.sound = .default
+        content.categoryIdentifier = resumeCategoryId
+
+        // Fire shortly after unlock; for simplicity, schedule ~1s later.
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
+        let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: trigger)
+
+        UNUserNotificationCenter.current().add(req) { err in
+            if let err = err { print("NOTIF schedule error:", err) }
         }
+    }
 
-        var secondsByKey: [Key: Int] = [:]
+    func resumeLastAutoStoppedIfRecent(maxAgeSeconds: TimeInterval = 30) {
+        guard let pid = lastAutoStoppedProjectId, let at = lastAutoStopAt else { return }
+        guard Date().timeIntervalSince(at) <= maxAgeSeconds else { return }
 
-        for e in entries where e.projectId == projectId {
-            let start = e.startAt
-            let end = e.endAt ?? now
-            guard end > start else { continue }
-
-            let task = (e.note ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-
-            var sliceStart = start
-            while sliceStart < end {
-                let dayStart = cal.startOfDay(for: sliceStart)
-                guard let nextDayStart = cal.date(byAdding: .day, value: 1, to: dayStart) else { break }
-
-                let sliceEnd = min(end, nextDayStart)
-                guard sliceEnd > sliceStart else { break }
-
-                let secs = Int(sliceEnd.timeIntervalSince(sliceStart).rounded(.toNearestOrAwayFromZero))
-                let dateStr = df.string(from: sliceStart)
-
-                let key = Key(date: dateStr, task: task)
-                secondsByKey[key, default: 0] += max(0, secs)
-
-                sliceStart = sliceEnd
-            }
-        }
-
-        let header = "date,task,hours"
-
-        let rows: [String] = secondsByKey.keys
-            .sorted { a, b in
-                if a.date != b.date { return a.date < b.date }
-                return a.task.localizedCaseInsensitiveCompare(b.task) == .orderedAscending
-            }
-            .map { key in
-                let secs = secondsByKey[key] ?? 0
-                let hours = Double(secs) / 3600.0
-                let hoursStr = String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), hours)
-                return "\(csvEscape(key.date)),\(csvEscape(key.task)),\(hoursStr)"
-            }
-
-        let csv = ([header] + rows).joined(separator: "\n") + "\n"
-
-        do {
-            try csv.write(to: outURL, atomically: true, encoding: .utf8)
-            return outURL
-        } catch {
-            print("EXPORT failed:", error)
-            return nil
+        // Resume means: select project, keep the current note, and start if note is non-empty.
+        selectedProjectId = pid
+        if canStart {
+            primaryAction()
         }
     }
 }
